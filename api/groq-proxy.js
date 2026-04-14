@@ -7,7 +7,7 @@ export default async function handler(req, res) {
   }
 
   // Use a verified Groq model identifier
-  const GROQ_MODEL = 'llama3-8b-8192';
+  const GROQ_MODEL = 'groq/compound';
 
   try {
     if (!req.body || !Array.isArray(req.body.messages) || req.body.messages.length === 0) {
