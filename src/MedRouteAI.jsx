@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   LineChart, Line, PieChart, Pie, Cell, Legend
@@ -28,9 +28,15 @@ const MedRouteAI = () => {
   const [disclaimerDismissed, setDisclaimerDismissed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  // Groq API configuration (Using Env Variable)
-  const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || '';
-  const GROQ_MODEL = 'openai/gpt-oss-120b';
+  // Simulated distances map
+  const simulatedDistances = useMemo(() => {
+    const dists = {};
+    HOSPITALS_DB.forEach(h => {
+      const charSum = (h.id || h.name).split('').reduce((sum, char) => sum + char.charCodeAt(0), 0);
+      dists[h.id] = ((charSum % 100) / 10 + 1).toFixed(1);
+    });
+    return dists;
+  }, []);
 
   // Search state
   const [searchQuery, setSearchQuery] = useState('');
@@ -79,45 +85,56 @@ const MedRouteAI = () => {
   // Share modal
   const [showShareModal, setShowShareModal] = useState(false);
   const [shareContent, setShareContent] = useState('');
+  const [copyStatus, setCopyStatus] = useState(null);
 
   // ─── GROQ API CALL HELPER ──────────────────────────────
   const callGroqAPI = useCallback(async (systemPrompt, userMessage) => {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage }
-        ],
-        temperature: 0.6,
-        max_tokens: 4096
-      })
-    });
-    if (!response.ok) {
-      const errData = await response.json().catch(() => ({}));
-      throw new Error(errData.error?.message || `Groq API error: ${response.status}`);
-    }
-    const data = await response.json();
-    let text = data.choices?.[0]?.message?.content || '';
-    
-    // Remove <think> and </think> wrapping if present (for some models like Qwen)
-    text = text.replace(/<think>[\s\S]*?<\/think>/, '').trim();
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 seconds timeout
 
-    // Parse JSON from response, handling possible markdown wrapping
-    const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/```\s*([\s\S]*?)\s*```/);
-    const jsonStr = jsonMatch ? jsonMatch[1] : text;
     try {
-      return JSON.parse(jsonStr.trim());
-    } catch {
-      // Try to extract JSON object from text
-      const objMatch = jsonStr.match(/\{[\s\S]*\}/);
-      if (objMatch) return JSON.parse(objMatch[0]);
-      throw new Error('Failed to parse AI response as JSON');
+      const response = await fetch('/api/groq-proxy', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMessage }
+          ],
+          temperature: 0.6,
+          max_tokens: 4096
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error?.message || `API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      let text = data.choices?.[0]?.message?.content || '';
+      
+      // Remove <think> and </think> wrapping if present
+      text = text.replace(/<think>[\s\S]*?<\/think>/, '').trim();
+
+      // Parse JSON from response
+      const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/```\s*([\s\S]*?)\s*```/);
+      const jsonStr = jsonMatch ? jsonMatch[1] : text;
+      try {
+        return JSON.parse(jsonStr.trim());
+      } catch {
+        const objMatch = jsonStr.match(/\{[\s\S]*\}/);
+        if (objMatch) return JSON.parse(objMatch[0]);
+        throw new Error('Failed to parse AI response as JSON');
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err.name === 'AbortError') throw new Error('Request timed out. Please try again.');
+      throw err;
     }
   }, []);
 
@@ -166,7 +183,7 @@ Use Indian medical context. The user may use Hinglish or local terms like "seene
         const budgetMap = {
           'under1l': h => h.tier === 'budget',
           '1-5l': h => h.tier === 'budget' || h.tier === 'mid',
-          '5-10l': h => true,
+          '5-10l': h => h.tier === 'mid' || h.tier === 'premium',
           'above10l': h => h.tier === 'premium'
         };
         if (budgetMap[searchBudget]) filtered = filtered.filter(budgetMap[searchBudget]);
@@ -426,8 +443,27 @@ ${costForm.comorbidities.length ? `⚕️ Conditions: ${costForm.comorbidities.j
     setShowShareModal(true);
   };
 
-  const copyToClipboard = (text) => {
-    navigator.clipboard.writeText(text);
+  const copyToClipboard = async (text) => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = text;
+        textArea.style.position = "absolute";
+        textArea.style.left = "-999999px";
+        document.body.prepend(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        textArea.remove();
+      }
+      setCopyStatus('success');
+      setTimeout(() => setCopyStatus(null), 3000);
+    } catch (err) {
+      console.error('Failed to copy', err);
+      setCopyStatus('error');
+      setTimeout(() => setCopyStatus(null), 3000);
+    }
   };
 
   // ─── UNIQUE SPECIALIZATIONS ────────────────────────────
@@ -821,7 +857,7 @@ ${costForm.comorbidities.length ? `⚕️ Conditions: ${costForm.comorbidities.j
                             <StarRating rating={hospital.rating} />
                             <span className="text-xs text-gray-400">{hospital.review_count.toLocaleString()} reviews</span>
                           </div>
-                          <p className="text-xs text-gray-500 mb-1">Simulated distance: {(Math.random() * 10 + 1).toFixed(1)} km</p>
+                          <p className="text-xs text-gray-500 mb-1">Simulated distance: {simulatedDistances[hospital.id] || '5.0'} km</p>
                           {proc && (
                             <div className="bg-gray-50 rounded-lg px-3 py-2 mb-3">
                               <p className="text-xs text-gray-500">Estimated range</p>
@@ -2040,6 +2076,8 @@ ${costForm.comorbidities.length ? `⚕️ Conditions: ${costForm.comorbidities.j
             >
               <Copy className="w-4 h-4" /> Copy to Clipboard
             </button>
+            {copyStatus === 'success' && <p className="text-sm text-green-600 mt-2 text-center animate-fadeIn">✅ Copied to clipboard!</p>}
+            {copyStatus === 'error' && <p className="text-sm text-red-600 mt-2 text-center animate-fadeIn">❌ Failed to copy to clipboard.</p>}
           </div>
         </div>
       </div>
